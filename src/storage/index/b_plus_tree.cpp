@@ -68,8 +68,26 @@ auto BPLUSTREE_TYPE::GetValue(const KeyType& key,
                               std::vector<ValueType>* result, Transaction* txn)
      ->  bool
 {
-  //Your code here
-  return true;
+  page_id_t rootId = GetRootPageId();
+  if (rootId == INVALID_PAGE_ID) {return false;}
+  auto currentPageGuard = bpm_ -> FetchPageRead(rootId);
+  while (!currentPageGuard.template As<BPlusTreePage>() -> IsLeafPage()) {
+    const InternalPage* currentInternalPage = currentPageGuard.template As<InternalPage>();
+    int index = BinaryFind(currentInternalPage, key);
+    if (index == 1) {
+      if (comparator_(key, currentInternalPage -> KeyAt(index)) == -1) {
+        index = 0;
+      }
+    }
+    currentPageGuard = bpm_ -> FetchPageRead(currentInternalPage -> ValueAt(index));
+  }
+  const LeafPage* targetLeaf = currentPageGuard.template As<LeafPage>();
+  int targetIndex = BinaryFind(targetLeaf, key);
+  if (targetIndex != -1 && comparator_(targetLeaf -> KeyAt(targetIndex), key) == 0) {
+    result -> push_back(targetLeaf -> ValueAt(targetIndex));
+    return true;
+  }
+  return false;
 }
 
 /*****************************************************************************
