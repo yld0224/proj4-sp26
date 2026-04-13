@@ -88,7 +88,40 @@ INDEX_TEMPLATE_ARGUMENTS
 auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
                             Transaction* txn)  ->  bool
 {
-  //Your code here
+  if (IsEmpty()){
+    page_id_t id;
+    auto newPageGuard = bpm_ ->NewPageGuarded(&id);
+    auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
+    auto currentHead = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
+    currentHead -> root_page_id_ = id;
+    auto writePageGuard = newPageGuard.UpgradeWrite();
+    LeafPage* newPage = writePageGuard.template AsMut<LeafPage>();
+    newPage -> Init(leaf_max_size_);
+    newPage -> IncreaseSize(1);
+    newPage -> SetAt(0, key, value);
+    return true; 
+  }//插入第一个键值对的情况
+  auto currentPageGuard = bpm_ -> FetchPageWrite(GetRootPageId());
+  while (!currentPageGuard.template As<BPlusTreePage>() -> IsLeafPage()) {
+    const InternalPage* currentInternalPage = currentPageGuard.template As<InternalPage>();
+    int index = BinaryFind(currentInternalPage, key);
+    if (index == 1) {
+      if (comparator_(key, currentInternalPage -> KeyAt(index)) == -1) {
+        index = 0;
+      }
+    }
+    currentPageGuard = bpm_ -> FetchPageWrite(currentInternalPage -> ValueAt(index));
+  }//从当前页找到叶子页
+  LeafPage* targetLeaf = currentPageGuard.template AsMut<LeafPage>();
+  int targetIndex = BinaryFind(targetLeaf, key);
+  if (targetIndex != -1 && comparator_(targetLeaf -> KeyAt(targetIndex), key) == 0) {
+    return false;
+  }//尝试插入多个相同key,直接返回false
+  targetLeaf -> IncreaseSize(1);
+  for (int i = targetLeaf -> GetSize() - 1; i > targetIndex; --i) {
+    targetLeaf -> SetAt(i, targetLeaf -> KeyAt(i - 1), targetLeaf -> ValueAt(i - 1));
+  }
+  targetLeaf -> SetAt(targetIndex + 1, key, value);//插入到叶子的键值对中
   return true;
 }
 
@@ -140,7 +173,7 @@ auto BPLUSTREE_TYPE::BinaryFind(const LeafPage* leaf_page, const KeyType& key)
   }
 
   return r;
-}
+}//这里的binaryfind找的是最后一个小于等于key的position
 
 INDEX_TEMPLATE_ARGUMENTS
 auto BPLUSTREE_TYPE::BinaryFind(const InternalPage* internal_page,
