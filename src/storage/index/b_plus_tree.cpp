@@ -140,22 +140,24 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
     auto newPageGuard = bpm_ -> NewPageGuarded(&newPageId);
     auto writePageGuard = newPageGuard.UpgradeWrite();
     LeafPage* newPage = writePageGuard.template AsMut<LeafPage>();
+    newPage -> Init(leaf_max_size_);
     newPage -> SetSize(targetLeaf -> GetSize() - index);
-    for (int i = 0; i < targetLeaf -> GetSize() - index; ++i) {
-      newPage -> SetAt(i, targetLeaf -> KeyAt(i + index), targetLeaf -> ValueAt(i + index));
+    for (int i = index; i < targetLeaf -> GetSize(); ++i) {
+      newPage -> SetAt(i - index, targetLeaf -> KeyAt(i), targetLeaf -> ValueAt(i));
     }
     targetLeaf -> SetSize(index);
-    targetLeaf -> SetNextPageId(newPageId);//维护链表
+    newPage -> SetNextPageId(targetLeaf -> GetNextPageId());//新叶子继承旧叶子的next
+    targetLeaf -> SetNextPageId(newPageId);//旧叶子指向新叶子
     if (parentId.empty()) {
       page_id_t newRootId;
-      auto newPageGuard = bpm_ -> NewPageGuarded(&newRootId);
+      auto newRootGuard = bpm_ -> NewPageGuarded(&newRootId);
       auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
       auto currentHead = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
       currentHead -> root_page_id_ = newRootId;
-      auto writePageGuard = newPageGuard.UpgradeWrite();
-      InternalPage* newRoot = writePageGuard.template AsMut<InternalPage>();
+      auto writeRootPageGuard = newRootGuard.UpgradeWrite();
+      InternalPage* newRoot = writeRootPageGuard.template AsMut<InternalPage>();
       newRoot -> Init(internal_max_size_);
-      newRoot -> IncreaseSize(2);
+      newRoot -> SetSize(2);
       newRoot -> SetKeyAt(1, key);
       newRoot -> SetValueAt(1, newPageGuard.PageId());
       newRoot -> SetValueAt(0, currentPageGuard.PageId());
@@ -187,6 +189,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
         rightPage -> SetKeyAt(i, currentPage -> KeyAt(mid + i));
         rightPage -> SetValueAt(i, currentPage -> ValueAt(mid + i));
       }
+      KeyType midKey = currentPage -> KeyAt(mid);
       currentPage -> SetSize(mid);
       if (!parentId.empty()) {
         page_id_t parent = parentId.top().first;
@@ -199,20 +202,20 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
           currentPage -> SetKeyAt(i, currentPage -> KeyAt(i - 1));
           currentPage -> SetValueAt(i, currentPage -> ValueAt(i - 1));
         }
-        currentPage -> SetKeyAt(keyPosition + 1, currentPage -> KeyAt(mid));
+        currentPage -> SetKeyAt(keyPosition + 1, midKey);
         currentPage -> SetValueAt(keyPosition + 1, rightPageId);
         continue;
       }//情况3: 内部节点并且不是根节点
       page_id_t newRootId;
-      auto newPageGuard = bpm_ -> NewPageGuarded(&newRootId);
+      auto newRootGuard = bpm_ -> NewPageGuarded(&newRootId);
       auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
       auto currentHead = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
       currentHead -> root_page_id_ = newRootId;
-      auto writePageGuard = newPageGuard.UpgradeWrite();
-      InternalPage* newRoot = writePageGuard.template AsMut<InternalPage>();
+      auto writeRootPageGuard = newRootGuard.UpgradeWrite();
+      InternalPage* newRoot = writeRootPageGuard.template AsMut<InternalPage>();
       newRoot -> Init(internal_max_size_);
-      newRoot -> IncreaseSize(2);
-      newRoot -> SetKeyAt(1, currentPage -> KeyAt(mid));
+      newRoot -> SetSize(2);
+      newRoot -> SetKeyAt(1, midKey);
       newRoot -> SetValueAt(1, rightPageId);
       newRoot -> SetValueAt(0, currentPageGuard.PageId());
       return true;
