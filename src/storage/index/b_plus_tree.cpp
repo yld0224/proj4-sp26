@@ -240,9 +240,193 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
 INDEX_TEMPLATE_ARGUMENTS
 void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
 {
-  //Your code here
+  if (IsEmpty()) {return;}
+  std::stack<std::pair<page_id_t, int>> parentId;
+  auto currentPageGuard = bpm_ -> FetchPageWrite(GetRootPageId());
+  while (!currentPageGuard.template As<BPlusTreePage>() -> IsLeafPage()) {
+    const InternalPage* currentInternalPage = currentPageGuard.template As<InternalPage>();
+    int index = BinaryFind(currentInternalPage, key);
+    parentId.push({currentPageGuard.PageId(), index});
+    currentPageGuard = bpm_ -> FetchPageWrite(currentInternalPage -> ValueAt(index));
+  }
+  LeafPage* targetLeaf = currentPageGuard.template AsMut<LeafPage>();
+  int targetIndex = BinaryFind(targetLeaf, key);
+  if (targetIndex == -1 || comparator_(targetLeaf -> KeyAt(targetIndex), key) != 0) {
+    return;
+  }//如果待删除的key不在树中,直接返回
+  for (int i = targetIndex + 1; i < targetLeaf -> GetSize(); ++i) {
+    targetLeaf -> SetAt(i - 1, targetLeaf -> KeyAt(i), targetLeaf -> ValueAt(i));
+  }
+  targetLeaf -> IncreaseSize(-1);
+  if (targetLeaf -> GetSize() >= targetLeaf -> GetMinSize()) {
+    return;
+  }//没有触发underflow
+  if (parentId.empty()) {
+    if (targetLeaf -> GetSize() == 0) {
+      auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
+      auto headerPage = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
+      headerPage -> root_page_id_ = INVALID_PAGE_ID;
+      bpm_ -> DeletePage(currentPageGuard.PageId());
+    }
+    return;
+  }//当前节点已经是根节点
+  page_id_t fatherId = parentId.top().first;
+  currentPageGuard = bpm_ -> FetchPageWrite(fatherId);
+  InternalPage* currentPage = currentPageGuard.template AsMut<InternalPage>();
+  int pos = parentId.top().second;
+  parentId.pop();
+  if (pos > 0) {
+    auto leftPageGuard = bpm_ -> FetchPageWrite(currentPage ->ValueAt(pos - 1));
+    LeafPage* leftPage = leftPageGuard.template AsMut<LeafPage>();
+    if (leftPage -> GetSize() > leftPage -> GetMinSize()) {
+      int vicPos = leftPage -> GetSize() - 1;
+      targetLeaf -> IncreaseSize(1);
+      for (int i = targetLeaf -> GetSize() - 1; i > 0; --i) {
+        targetLeaf -> SetAt(i, targetLeaf -> KeyAt(i - 1), targetLeaf -> ValueAt(i - 1));
+      }
+      targetLeaf -> SetAt(0, leftPage -> KeyAt(vicPos), leftPage -> ValueAt(vicPos));
+      leftPage -> IncreaseSize(-1);
+      currentPage -> SetKeyAt(pos, targetLeaf -> KeyAt(0));
+      return;
+    }
+  }
+  if (pos <= currentPage -> GetSize() - 2) {
+    auto rightPageGuard = bpm_ -> FetchPageWrite(currentPage -> ValueAt(pos + 1));
+    LeafPage* rightPage = rightPageGuard.template AsMut<LeafPage>();
+    if (rightPage -> GetSize() > rightPage -> GetMinSize()) {
+      int vicPos = 0;
+      targetLeaf -> IncreaseSize(1);
+      targetLeaf -> SetAt(targetLeaf -> GetSize() - 1, rightPage -> KeyAt(vicPos), rightPage -> ValueAt(vicPos));
+      for (int i = 0; i < rightPage -> GetSize(); ++i) {
+        rightPage -> SetAt(i, targetLeaf -> KeyAt(i + 1), targetLeaf -> ValueAt(i + 1));
+      }
+      rightPage -> IncreaseSize(-1);
+      currentPage -> SetKeyAt(pos + 1, rightPage -> KeyAt(0));
+      return;
+    }
+  }//尝试从左右兄弟redistribute
+  if (pos > 0) {
+    auto leftPageGuard = bpm_ -> FetchPageWrite(currentPage ->ValueAt(pos - 1));
+    LeafPage* leftPage = leftPageGuard.template AsMut<LeafPage>();
+    int startPos = leftPage -> GetSize();
+    leftPage -> IncreaseSize(targetLeaf -> GetSize());
+    for (int i = startPos; i < leftPage -> GetSize(); ++i) {
+      leftPage -> SetAt(i, targetLeaf -> KeyAt(i - startPos), targetLeaf -> ValueAt(i - startPos));
+    }
+    leftPage -> SetNextPageId(targetLeaf -> GetNextPageId());//设置链表
+    bpm_ -> DeletePage(currentPage -> ValueAt(pos));
+    for (int i = pos; i < currentPage -> GetSize() - 1; ++i){
+      currentPage -> SetKeyAt(i, currentPage -> KeyAt(i + 1));
+      currentPage -> SetValueAt(i, currentPage -> ValueAt(i + 1));
+    }
+    currentPage -> IncreaseSize(-1);
+  } else {
+    auto rightPageGuard = bpm_ -> FetchPageWrite(currentPage -> ValueAt(pos + 1));
+    LeafPage* rightPage = rightPageGuard.template AsMut<LeafPage>();
+    int startPos = targetLeaf -> GetSize();
+    targetLeaf -> IncreaseSize(rightPage -> GetSize());
+    for (int i = startPos; i < targetLeaf -> GetSize(); ++i) {
+      targetLeaf -> SetAt(i, rightPage -> KeyAt(i - startPos), rightPage -> ValueAt(i - startPos));
+    }
+    targetLeaf -> SetNextPageId(rightPage -> GetNextPageId());
+    bpm_ -> DeletePage(currentPage -> ValueAt(pos + 1));
+    for (int i = pos + 1; i < currentPage -> GetSize() - 1; ++i) {
+      currentPage -> SetKeyAt(i, currentPage -> KeyAt(i + 1));
+      currentPage -> SetValueAt(i, currentPage -> ValueAt(i + 1));
+    }
+    currentPage -> IncreaseSize(-1);
+  }//从左右兄弟合并,转内部节点的调整
+  while (currentPage -> GetSize() < currentPage -> GetMinSize()) {
+    if (parentId.empty()) {
+      if (currentPage -> GetSize() == 1) {
+        auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
+        BPlusTreeHeaderPage* headerPage = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
+        headerPage -> root_page_id_ = currentPage -> ValueAt(0);
+        bpm_ -> DeletePage(currentPageGuard.PageId());
+      }
+      return;
+    }//如果已经上升到根节点依然underflow,若根只有单独节点则换根,否则返回
+    fatherId = parentId.top().first;
+    auto nextPageGuard = bpm_ -> FetchPageWrite(fatherId);
+    InternalPage* nextPage = nextPageGuard.template AsMut<InternalPage>();
+    pos = parentId.top().second;
+    parentId.pop();
+    if (pos > 0) {
+      auto leftPageGuard = bpm_ -> FetchPageWrite(nextPage ->ValueAt(pos - 1));
+      InternalPage* leftPage = leftPageGuard.template AsMut<InternalPage>();
+      if (leftPage -> GetSize() > leftPage -> GetMinSize()) {
+        int vicPos = leftPage -> GetSize() - 1;
+        currentPage -> IncreaseSize(1);
+        for (int i = currentPage -> GetSize() - 1; i >= 2; --i) {
+          currentPage -> SetKeyAt(i, currentPage -> KeyAt(i - 1));
+          currentPage -> SetValueAt(i, currentPage -> ValueAt(i - 1));
+        }
+        currentPage -> SetValueAt(1, currentPage -> ValueAt(0));
+        currentPage -> SetKeyAt(1, nextPage -> KeyAt(pos));
+        currentPage -> SetValueAt(0, leftPage -> ValueAt(vicPos));
+        nextPage -> SetKeyAt(pos, leftPage -> KeyAt(vicPos));
+        leftPage -> IncreaseSize(-1);
+        return;
+      }
+    }
+    if (pos <= nextPage -> GetSize() - 2) {
+      auto rightPageGuard = bpm_ -> FetchPageWrite(nextPage -> ValueAt(pos + 1));
+      InternalPage* rightPage = rightPageGuard.template AsMut<InternalPage>();
+      if (rightPage -> GetSize() > rightPage -> GetMinSize()) {
+        int vicPos = 0;
+        currentPage -> IncreaseSize(1);
+        currentPage -> SetKeyAt(currentPage -> GetSize() - 1, nextPage -> KeyAt(pos + 1));
+        currentPage -> SetValueAt(currentPage -> GetSize() - 1, rightPage -> ValueAt(vicPos));
+        nextPage -> SetKeyAt(pos + 1, rightPage -> KeyAt(1));
+        rightPage -> SetValueAt(0, rightPage -> ValueAt(1));
+        for (int i = 1; i <= rightPage -> GetSize() - 2; ++i) {
+          rightPage -> SetKeyAt(i, rightPage -> KeyAt(i + 1));
+          rightPage -> SetValueAt(i, rightPage -> ValueAt(i + 1));
+        }
+        rightPage -> IncreaseSize(-1);
+        return;
+      }
+    }
+    if (pos > 0) {
+      auto leftPageGuard = bpm_ -> FetchPageWrite(nextPage -> ValueAt(pos - 1));
+      InternalPage* leftPage = leftPageGuard.template AsMut<InternalPage>();
+      int startPos = leftPage -> GetSize();
+      leftPage -> IncreaseSize(targetLeaf -> GetSize());
+      leftPage -> SetKeyAt(startPos, nextPage -> KeyAt(pos));
+      leftPage -> SetValueAt(startPos, currentPage -> ValueAt(0));
+      for (int i = startPos + 1; i < leftPage -> GetSize(); ++i) {
+        leftPage -> SetKeyAt(i, currentPage -> KeyAt(i - startPos));
+        leftPage -> SetValueAt(i, currentPage -> ValueAt(i - startPos));
+      }
+      bpm_ -> DeletePage(nextPage -> ValueAt(pos));
+      for (int i = pos; i < nextPage -> GetSize() - 1; ++i) {
+        nextPage -> SetKeyAt(i, nextPage -> KeyAt(i + 1));
+        nextPage -> SetValueAt(i, nextPage -> ValueAt(i + 1));
+      }
+      nextPage -> IncreaseSize(-1);
+      currentPage = nextPage;
+    } else {
+      auto rightPageGuard = bpm_ -> FetchPageWrite(nextPage -> ValueAt(pos + 1));
+      InternalPage* rightPage = rightPageGuard.template AsMut<InternalPage>();
+      int startPos = currentPage -> GetSize();
+      currentPage -> IncreaseSize(rightPage -> GetSize());
+      currentPage -> SetKeyAt(startPos, nextPage -> KeyAt(pos + 1));
+      currentPage -> SetValueAt(startPos, rightPage -> ValueAt(0));
+      for (int i = startPos + 1; i < currentPage -> GetSize(); ++i) {
+        currentPage -> SetKeyAt(i, rightPage -> KeyAt(i - startPos));
+        currentPage -> SetValueAt(i, rightPage -> ValueAt(i - startPos));
+      }
+      bpm_ -> DeletePage(nextPage -> ValueAt(pos + 1));
+      for (int i = pos; i < nextPage -> GetSize() - 1; ++i) {
+        nextPage -> SetKeyAt(i, nextPage -> KeyAt(pos + 1));
+        nextPage -> SetValueAt(i, nextPage -> ValueAt(pos + 1));
+      }
+      nextPage -> IncreaseSize(-1);
+      currentPage = nextPage;
+    }
+  }//内部节点调整,分类方式与叶子相同,先考虑redistribute,再merge处理
+  return;
 }
-
 /*****************************************************************************
  * INDEX ITERATOR
  *****************************************************************************/
