@@ -297,8 +297,8 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
       int vicPos = 0;
       targetLeaf -> IncreaseSize(1);
       targetLeaf -> SetAt(targetLeaf -> GetSize() - 1, rightPage -> KeyAt(vicPos), rightPage -> ValueAt(vicPos));
-      for (int i = 0; i < rightPage -> GetSize(); ++i) {
-        rightPage -> SetAt(i, targetLeaf -> KeyAt(i + 1), targetLeaf -> ValueAt(i + 1));
+      for (int i = 0; i < rightPage -> GetSize() - 1; ++i) {
+        rightPage -> SetAt(i, rightPage -> KeyAt(i + 1), rightPage -> ValueAt(i + 1));
       }
       rightPage -> IncreaseSize(-1);
       currentPage -> SetKeyAt(pos + 1, rightPage -> KeyAt(0));
@@ -391,7 +391,7 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
       auto leftPageGuard = bpm_ -> FetchPageWrite(nextPage -> ValueAt(pos - 1));
       InternalPage* leftPage = leftPageGuard.template AsMut<InternalPage>();
       int startPos = leftPage -> GetSize();
-      leftPage -> IncreaseSize(targetLeaf -> GetSize());
+      leftPage -> IncreaseSize(currentPage -> GetSize());
       leftPage -> SetKeyAt(startPos, nextPage -> KeyAt(pos));
       leftPage -> SetValueAt(startPos, currentPage -> ValueAt(0));
       for (int i = startPos + 1; i < leftPage -> GetSize(); ++i) {
@@ -417,9 +417,9 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
         currentPage -> SetValueAt(i, rightPage -> ValueAt(i - startPos));
       }
       bpm_ -> DeletePage(nextPage -> ValueAt(pos + 1));
-      for (int i = pos; i < nextPage -> GetSize() - 1; ++i) {
-        nextPage -> SetKeyAt(i, nextPage -> KeyAt(pos + 1));
-        nextPage -> SetValueAt(i, nextPage -> ValueAt(pos + 1));
+      for (int i = pos + 1; i < nextPage -> GetSize() - 1; ++i) {
+        nextPage -> SetKeyAt(i, nextPage -> KeyAt(i + 1));
+        nextPage -> SetValueAt(i, nextPage -> ValueAt(i + 1));
       }
       nextPage -> IncreaseSize(-1);
       currentPage = nextPage;
