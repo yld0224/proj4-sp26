@@ -102,6 +102,7 @@ INDEX_TEMPLATE_ARGUMENTS
 auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
                             Transaction* txn)  ->  bool
 {
+  Context ctx;
   if (IsEmpty()){
     page_id_t id;
     auto newPageGuard = bpm_ -> NewPageGuarded(&id);
@@ -115,12 +116,15 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
     newPage -> SetAt(0, key, value);
     return true; 
   }//插入第一个键值对的情况
-  std::stack<std::pair<page_id_t, int>> parentId{};//父亲页和插入位置
-  auto currentPageGuard = bpm_ -> FetchPageWrite(GetRootPageId());
+  ctx.root_page_id_ = GetRootPageId();
+  auto currentPageGuard = bpm_ -> FetchPageWrite(ctx.root_page_id_);
   while (!currentPageGuard.template As<BPlusTreePage>() -> IsLeafPage()) {
     const InternalPage* currentInternalPage = currentPageGuard.template As<InternalPage>();
     int index = BinaryFind(currentInternalPage, key);
-    parentId.push({currentPageGuard.PageId(), index});
+    if (currentInternalPage -> GetSize() < currentInternalPage -> GetMaxSize()){
+      ctx.write_set_.clear();
+    }//螃蟹法则,当前节点如果安全,释放祖先节点的所有写锁
+    ctx.write_set_.push_back(std::move(currentPageGuard));
     currentPageGuard = bpm_ -> FetchPageWrite(currentInternalPage -> ValueAt(index));
   }//从当前页找到叶子页
   LeafPage* targetLeaf = currentPageGuard.template AsMut<LeafPage>();
@@ -135,7 +139,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
   targetLeaf -> SetAt(targetIndex + 1, key, value);//插入到叶子的键值对中
   if (targetLeaf -> GetMaxSize() < targetLeaf -> GetSize()) {
     int index = targetLeaf -> GetSize() / 2;
-    KeyType key = targetLeaf -> KeyAt(index);
+    KeyType upKey = targetLeaf -> KeyAt(index);
     page_id_t newPageId;
     auto newPageGuard = bpm_ -> NewPageGuarded(&newPageId);
     auto writePageGuard = newPageGuard.UpgradeWrite();
@@ -148,7 +152,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
     targetLeaf -> SetSize(index);
     newPage -> SetNextPageId(targetLeaf -> GetNextPageId());//新叶子继承旧叶子的next
     targetLeaf -> SetNextPageId(newPageId);//旧叶子指向新叶子
-    if (parentId.empty()) {
+    if (currentPageGuard.PageId() == ctx.root_page_id_) {
       page_id_t newRootId;
       auto newRootGuard = bpm_ -> NewPageGuarded(&newRootId);
       auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
@@ -158,23 +162,23 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
       InternalPage* newRoot = writeRootPageGuard.template AsMut<InternalPage>();
       newRoot -> Init(internal_max_size_);
       newRoot -> SetSize(2);
-      newRoot -> SetKeyAt(1, key);
+      newRoot -> SetKeyAt(1, upKey);
       newRoot -> SetValueAt(1, newPageGuard.PageId());
       newRoot -> SetValueAt(0, currentPageGuard.PageId());
       return true;
     }//情况1: 叶子节点并且是根节点,新建根节点即可直接返回
-    page_id_t parent = parentId.top().first;
-    int keyPosition = parentId.top().second;
-    parentId.pop();
-    currentPageGuard = bpm_ -> FetchPageWrite(parent);
-    InternalPage* currentPage = currentPageGuard.template AsMut<InternalPage>();
-    currentPage -> IncreaseSize(1);
-    for (int i = currentPage -> GetSize() - 1; i > keyPosition + 1 ; --i) {
-      currentPage -> SetKeyAt(i, currentPage -> KeyAt(i - 1));
-      currentPage -> SetValueAt(i, currentPage -> ValueAt(i - 1));
+    WritePageGuard& parentGuard = ctx.write_set_.back();
+    InternalPage* parentPage = parentGuard.template AsMut<InternalPage>();
+    parentPage -> IncreaseSize(1);
+    int keyPosition = BinaryFind(parentPage, upKey);//重新查找一遍,因数据可能被其他线程修改
+    for (int i = parentPage -> GetSize() - 1; i > keyPosition + 1 ; --i) {
+      parentPage -> SetKeyAt(i, parentPage -> KeyAt(i - 1));
+      parentPage -> SetValueAt(i, parentPage -> ValueAt(i - 1));
     }
-    currentPage -> SetKeyAt(keyPosition + 1, key);
-    currentPage -> SetValueAt(keyPosition + 1, newPageId);
+    parentPage -> SetKeyAt(keyPosition + 1, upKey);
+    parentPage -> SetValueAt(keyPosition + 1, newPageId);
+    InternalPage* currentPage = parentPage;
+    page_id_t currentId = parentGuard.PageId();
     //情况2: 叶子节点不是根节点,向上维护,转情况3或4
     while (currentPage -> GetMaxSize() < currentPage -> GetSize()) {
       int mid = (currentPage -> GetSize()) / 2;
@@ -191,19 +195,20 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
       }
       KeyType midKey = currentPage -> KeyAt(mid);
       currentPage -> SetSize(mid);
-      if (!parentId.empty()) {
-        page_id_t parent = parentId.top().first;
-        int keyPosition = parentId.top().second;
-        parentId.pop();
-        currentPageGuard = bpm_ -> FetchPageWrite(parent);
-        currentPage = currentPageGuard.template AsMut<InternalPage>();
-        currentPage -> IncreaseSize(1);
-        for (int i = currentPage -> GetSize() - 1; i > keyPosition + 1 ; --i) {
-          currentPage -> SetKeyAt(i, currentPage -> KeyAt(i - 1));
-          currentPage -> SetValueAt(i, currentPage -> ValueAt(i - 1));
+      if (currentId != ctx.root_page_id_) {
+        ctx.write_set_.pop_back();
+        WritePageGuard& parentGuard = ctx.write_set_.back();
+        parentPage = parentGuard.template AsMut<InternalPage>();
+        parentPage -> IncreaseSize(1);
+        keyPosition = BinaryFind(parentPage, midKey);
+        for (int i = parentPage -> GetSize() - 1; i > keyPosition + 1 ; --i) {
+          parentPage -> SetKeyAt(i, parentPage -> KeyAt(i - 1));
+          parentPage -> SetValueAt(i, parentPage -> ValueAt(i - 1));
         }
-        currentPage -> SetKeyAt(keyPosition + 1, midKey);
-        currentPage -> SetValueAt(keyPosition + 1, rightPageId);
+        parentPage -> SetKeyAt(keyPosition + 1, midKey);
+        parentPage -> SetValueAt(keyPosition + 1, rightPageId);
+        currentPage = parentPage;
+        currentId = parentGuard.PageId();
         continue;
       }//情况3: 内部节点并且不是根节点
       page_id_t newRootId;
@@ -217,7 +222,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
       newRoot -> SetSize(2);
       newRoot -> SetKeyAt(1, midKey);
       newRoot -> SetValueAt(1, rightPageId);
-      newRoot -> SetValueAt(0, currentPageGuard.PageId());
+      newRoot -> SetValueAt(0, currentId);
       return true;
       //情况4: 内部节点并且是根节点
     }
