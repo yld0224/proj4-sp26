@@ -247,13 +247,21 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
 INDEX_TEMPLATE_ARGUMENTS
 void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
 {
-  if (IsEmpty()) {return;}
-  std::stack<std::pair<page_id_t, int>> parentId;
-  auto currentPageGuard = bpm_ -> FetchPageWrite(GetRootPageId());
+  Context ctx;
+  ctx.write_set_.push_back(bpm_ -> FetchPageWrite(header_page_id_));
+  WritePageGuard& headerPageGuard = ctx.write_set_.front();
+  if (headerPageGuard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_ == INVALID_PAGE_ID) {
+    return;
+  }
+  ctx.root_page_id_ = headerPageGuard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_;
+  auto currentPageGuard = bpm_ -> FetchPageWrite(ctx.root_page_id_);
   while (!currentPageGuard.template As<BPlusTreePage>() -> IsLeafPage()) {
     const InternalPage* currentInternalPage = currentPageGuard.template As<InternalPage>();
     int index = BinaryFind(currentInternalPage, key);
-    parentId.push({currentPageGuard.PageId(), index});
+    if (currentInternalPage -> GetSize() > currentInternalPage -> GetMinSize()) {
+      ctx.write_set_.clear();
+    }
+    ctx.write_set_.push_back(std::move(currentPageGuard));
     currentPageGuard = bpm_ -> FetchPageWrite(currentInternalPage -> ValueAt(index));
   }
   LeafPage* targetLeaf = currentPageGuard.template AsMut<LeafPage>();
@@ -268,22 +276,20 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
   if (targetLeaf -> GetSize() >= targetLeaf -> GetMinSize()) {
     return;
   }//没有触发underflow
-  if (parentId.empty()) {
+  if (currentPageGuard.PageId() == ctx.root_page_id_) {
     if (targetLeaf -> GetSize() == 0) {
-      auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
+      WritePageGuard& headerPageGuard = ctx.write_set_.front();
       auto headerPage = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
       headerPage -> root_page_id_ = INVALID_PAGE_ID;
       bpm_ -> DeletePage(currentPageGuard.PageId());
     }
     return;
   }//当前节点已经是根节点
-  page_id_t fatherId = parentId.top().first;
-  currentPageGuard = bpm_ -> FetchPageWrite(fatherId);
-  InternalPage* currentPage = currentPageGuard.template AsMut<InternalPage>();
-  int pos = parentId.top().second;
-  parentId.pop();
+  WritePageGuard& targetParentGuard = ctx.write_set_.back();
+  InternalPage* fatherPage = targetParentGuard.template AsMut<InternalPage>();
+  int pos = BinaryFind(fatherPage, key);
   if (pos > 0) {
-    auto leftPageGuard = bpm_ -> FetchPageWrite(currentPage ->ValueAt(pos - 1));
+    auto leftPageGuard = bpm_ -> FetchPageWrite(fatherPage ->ValueAt(pos - 1));
     LeafPage* leftPage = leftPageGuard.template AsMut<LeafPage>();
     if (leftPage -> GetSize() > leftPage -> GetMinSize()) {
       int vicPos = leftPage -> GetSize() - 1;
@@ -293,12 +299,12 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
       }
       targetLeaf -> SetAt(0, leftPage -> KeyAt(vicPos), leftPage -> ValueAt(vicPos));
       leftPage -> IncreaseSize(-1);
-      currentPage -> SetKeyAt(pos, targetLeaf -> KeyAt(0));
+      fatherPage -> SetKeyAt(pos, targetLeaf -> KeyAt(0));
       return;
     }
   }
-  if (pos <= currentPage -> GetSize() - 2) {
-    auto rightPageGuard = bpm_ -> FetchPageWrite(currentPage -> ValueAt(pos + 1));
+  if (pos <= fatherPage -> GetSize() - 2) {
+    auto rightPageGuard = bpm_ -> FetchPageWrite(fatherPage -> ValueAt(pos + 1));
     LeafPage* rightPage = rightPageGuard.template AsMut<LeafPage>();
     if (rightPage -> GetSize() > rightPage -> GetMinSize()) {
       int vicPos = 0;
@@ -308,12 +314,12 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
         rightPage -> SetAt(i, rightPage -> KeyAt(i + 1), rightPage -> ValueAt(i + 1));
       }
       rightPage -> IncreaseSize(-1);
-      currentPage -> SetKeyAt(pos + 1, rightPage -> KeyAt(0));
+      fatherPage -> SetKeyAt(pos + 1, rightPage -> KeyAt(0));
       return;
     }
   }//尝试从左右兄弟redistribute
   if (pos > 0) {
-    auto leftPageGuard = bpm_ -> FetchPageWrite(currentPage ->ValueAt(pos - 1));
+    auto leftPageGuard = bpm_ -> FetchPageWrite(fatherPage ->ValueAt(pos - 1));
     LeafPage* leftPage = leftPageGuard.template AsMut<LeafPage>();
     int startPos = leftPage -> GetSize();
     leftPage -> IncreaseSize(targetLeaf -> GetSize());
@@ -321,14 +327,14 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
       leftPage -> SetAt(i, targetLeaf -> KeyAt(i - startPos), targetLeaf -> ValueAt(i - startPos));
     }
     leftPage -> SetNextPageId(targetLeaf -> GetNextPageId());//设置链表
-    bpm_ -> DeletePage(currentPage -> ValueAt(pos));
-    for (int i = pos; i < currentPage -> GetSize() - 1; ++i){
-      currentPage -> SetKeyAt(i, currentPage -> KeyAt(i + 1));
-      currentPage -> SetValueAt(i, currentPage -> ValueAt(i + 1));
+    bpm_ -> DeletePage(fatherPage -> ValueAt(pos));
+    for (int i = pos; i < fatherPage -> GetSize() - 1; ++i){
+      fatherPage -> SetKeyAt(i, fatherPage -> KeyAt(i + 1));
+      fatherPage -> SetValueAt(i, fatherPage -> ValueAt(i + 1));
     }
-    currentPage -> IncreaseSize(-1);
+    fatherPage -> IncreaseSize(-1);
   } else {
-    auto rightPageGuard = bpm_ -> FetchPageWrite(currentPage -> ValueAt(pos + 1));
+    auto rightPageGuard = bpm_ -> FetchPageWrite(fatherPage -> ValueAt(pos + 1));
     LeafPage* rightPage = rightPageGuard.template AsMut<LeafPage>();
     int startPos = targetLeaf -> GetSize();
     targetLeaf -> IncreaseSize(rightPage -> GetSize());
@@ -336,28 +342,29 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
       targetLeaf -> SetAt(i, rightPage -> KeyAt(i - startPos), rightPage -> ValueAt(i - startPos));
     }
     targetLeaf -> SetNextPageId(rightPage -> GetNextPageId());
-    bpm_ -> DeletePage(currentPage -> ValueAt(pos + 1));
-    for (int i = pos + 1; i < currentPage -> GetSize() - 1; ++i) {
-      currentPage -> SetKeyAt(i, currentPage -> KeyAt(i + 1));
-      currentPage -> SetValueAt(i, currentPage -> ValueAt(i + 1));
+    bpm_ -> DeletePage(fatherPage -> ValueAt(pos + 1));
+    for (int i = pos + 1; i < fatherPage -> GetSize() - 1; ++i) {
+      fatherPage -> SetKeyAt(i, fatherPage -> KeyAt(i + 1));
+      fatherPage -> SetValueAt(i, fatherPage -> ValueAt(i + 1));
     }
-    currentPage -> IncreaseSize(-1);
+    fatherPage -> IncreaseSize(-1);
   }//从左右兄弟合并,转内部节点的调整
+  currentPageGuard.Drop();
+  InternalPage* currentPage = fatherPage;
   while (currentPage -> GetSize() < currentPage -> GetMinSize()) {
-    if (parentId.empty()) {
+    WritePageGuard& currentGuard = ctx.write_set_.back();
+    WritePageGuard& currentParentGuard = ctx.write_set_[ctx.write_set_.size() - 2];
+    InternalPage* nextPage = currentParentGuard.template AsMut<InternalPage>();
+    pos = BinaryFind(nextPage, key);
+    if (ctx.write_set_.front().PageId() == header_page_id_ && ctx.write_set_.size() == 2) {
       if (currentPage -> GetSize() == 1) {
-        auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
+        WritePageGuard& headerPageGuard = ctx.write_set_.front();
         BPlusTreeHeaderPage* headerPage = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
         headerPage -> root_page_id_ = currentPage -> ValueAt(0);
-        bpm_ -> DeletePage(currentPageGuard.PageId());
+        bpm_ -> DeletePage(currentGuard.PageId());
       }
       return;
     }//如果已经上升到根节点依然underflow,若根只有单独节点则换根,否则返回
-    fatherId = parentId.top().first;
-    auto nextPageGuard = bpm_ -> FetchPageWrite(fatherId);
-    InternalPage* nextPage = nextPageGuard.template AsMut<InternalPage>();
-    pos = parentId.top().second;
-    parentId.pop();
     if (pos > 0) {
       auto leftPageGuard = bpm_ -> FetchPageWrite(nextPage ->ValueAt(pos - 1));
       InternalPage* leftPage = leftPageGuard.template AsMut<InternalPage>();
@@ -412,6 +419,7 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
       }
       nextPage -> IncreaseSize(-1);
       currentPage = nextPage;
+      ctx.write_set_.pop_back();
     } else {
       auto rightPageGuard = bpm_ -> FetchPageWrite(nextPage -> ValueAt(pos + 1));
       InternalPage* rightPage = rightPageGuard.template AsMut<InternalPage>();
@@ -430,6 +438,7 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
       }
       nextPage -> IncreaseSize(-1);
       currentPage = nextPage;
+      ctx.write_set_.pop_back();
     }
   }//内部节点调整,分类方式与叶子相同,先考虑redistribute,再merge处理
   return;
