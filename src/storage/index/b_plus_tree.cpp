@@ -103,10 +103,11 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
                             Transaction* txn)  ->  bool
 {
   Context ctx;
-  if (IsEmpty()){
+  ctx.write_set_.push_back(bpm_ -> FetchPageWrite(header_page_id_));//直接让headerpage入栈
+  WritePageGuard& headerPageGuard = ctx.write_set_.front();
+  if (headerPageGuard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_ == INVALID_PAGE_ID){
     page_id_t id;
     auto newPageGuard = bpm_ -> NewPageGuarded(&id);
-    auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
     auto currentHead = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
     currentHead -> root_page_id_ = id;
     auto writePageGuard = newPageGuard.UpgradeWrite();
@@ -116,14 +117,14 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
     newPage -> SetAt(0, key, value);
     return true; 
   }//插入第一个键值对的情况
-  ctx.root_page_id_ = GetRootPageId();
+  ctx.root_page_id_ = headerPageGuard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_;
   auto currentPageGuard = bpm_ -> FetchPageWrite(ctx.root_page_id_);
   while (!currentPageGuard.template As<BPlusTreePage>() -> IsLeafPage()) {
     const InternalPage* currentInternalPage = currentPageGuard.template As<InternalPage>();
     int index = BinaryFind(currentInternalPage, key);
     if (currentInternalPage -> GetSize() < currentInternalPage -> GetMaxSize()){
       ctx.write_set_.clear();
-    }//螃蟹法则,当前节点如果安全,释放祖先节点的所有写锁
+    }//悲观螃蟹法则,当前节点如果安全,释放祖先节点的所有写锁
     ctx.write_set_.push_back(std::move(currentPageGuard));
     currentPageGuard = bpm_ -> FetchPageWrite(currentInternalPage -> ValueAt(index));
   }//从当前页找到叶子页
@@ -155,7 +156,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
     if (currentPageGuard.PageId() == ctx.root_page_id_) {
       page_id_t newRootId;
       auto newRootGuard = bpm_ -> NewPageGuarded(&newRootId);
-      auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
+      WritePageGuard& headerPageGuard = ctx.write_set_.front();
       auto currentHead = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
       currentHead -> root_page_id_ = newRootId;
       auto writeRootPageGuard = newRootGuard.UpgradeWrite();
@@ -163,14 +164,14 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
       newRoot -> Init(internal_max_size_);
       newRoot -> SetSize(2);
       newRoot -> SetKeyAt(1, upKey);
-      newRoot -> SetValueAt(1, newPageGuard.PageId());
+      newRoot -> SetValueAt(1, newPageId);
       newRoot -> SetValueAt(0, currentPageGuard.PageId());
       return true;
     }//情况1: 叶子节点并且是根节点,新建根节点即可直接返回
     WritePageGuard& parentGuard = ctx.write_set_.back();
     InternalPage* parentPage = parentGuard.template AsMut<InternalPage>();
+    int keyPosition = BinaryFind(parentPage, upKey);//重新查找一遍,因数据可能被其他线程修改 fix:先查找再increase
     parentPage -> IncreaseSize(1);
-    int keyPosition = BinaryFind(parentPage, upKey);//重新查找一遍,因数据可能被其他线程修改
     for (int i = parentPage -> GetSize() - 1; i > keyPosition + 1 ; --i) {
       parentPage -> SetKeyAt(i, parentPage -> KeyAt(i - 1));
       parentPage -> SetValueAt(i, parentPage -> ValueAt(i - 1));
@@ -179,6 +180,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
     parentPage -> SetValueAt(keyPosition + 1, newPageId);
     InternalPage* currentPage = parentPage;
     page_id_t currentId = parentGuard.PageId();
+    currentPageGuard.Drop();
     //情况2: 叶子节点不是根节点,向上维护,转情况3或4
     while (currentPage -> GetMaxSize() < currentPage -> GetSize()) {
       int mid = (currentPage -> GetSize()) / 2;
@@ -196,11 +198,10 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
       KeyType midKey = currentPage -> KeyAt(mid);
       currentPage -> SetSize(mid);
       if (currentId != ctx.root_page_id_) {
-        ctx.write_set_.pop_back();
-        WritePageGuard& parentGuard = ctx.write_set_.back();
+        WritePageGuard& parentGuard = ctx.write_set_[ctx.write_set_.size() - 2];
         parentPage = parentGuard.template AsMut<InternalPage>();
+        keyPosition = BinaryFind(parentPage, midKey);//fix:先查找
         parentPage -> IncreaseSize(1);
-        keyPosition = BinaryFind(parentPage, midKey);
         for (int i = parentPage -> GetSize() - 1; i > keyPosition + 1 ; --i) {
           parentPage -> SetKeyAt(i, parentPage -> KeyAt(i - 1));
           parentPage -> SetValueAt(i, parentPage -> ValueAt(i - 1));
@@ -209,11 +210,12 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
         parentPage -> SetValueAt(keyPosition + 1, rightPageId);
         currentPage = parentPage;
         currentId = parentGuard.PageId();
+        ctx.write_set_.pop_back(); //fix:最后释放锁
         continue;
       }//情况3: 内部节点并且不是根节点
       page_id_t newRootId;
       auto newRootGuard = bpm_ -> NewPageGuarded(&newRootId);
-      auto headerPageGuard = bpm_ -> FetchPageWrite(header_page_id_);
+      WritePageGuard& headerPageGuard = ctx.write_set_.front();
       auto currentHead = headerPageGuard.template AsMut<BPlusTreeHeaderPage>();
       currentHead -> root_page_id_ = newRootId;
       auto writeRootPageGuard = newRootGuard.UpgradeWrite();
